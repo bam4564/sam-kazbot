@@ -1,0 +1,6 @@
+telethon 
+tweepy
+gspread
+python-dotenv
+networkx
+matplotlib
