@@ -1,24 +1,21 @@
 import asyncio
 import tweepy
-import math
 import os
 import re 
-import json 
 import logging 
 import networkx as nx 
-import gspread
+import datetime as dt 
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from typing import List 
+from datetime import datetime 
 from pathlib import Path 
-from concurrent.futures import ThreadPoolExecutor
-from telethon import TelegramClient, sync
-from telethon.tl.functions.channels import GetParticipantsRequest
-from telethon.tl.types import ChannelParticipantsSearch, InputChannel
-from telethon import events
-from telethon.tl.functions.messages import GetDialogsRequest
-from telethon.tl.types import InputPeerEmpty
-from telethon.utils import get_display_name, get_peer, get_input_user
+from google.cloud import ndb
+
 
 from telethon.tl.custom.message import Message
 import gspread
+from telethon import TelegramClient
 
 from dotenv import load_dotenv
 
@@ -27,51 +24,72 @@ assert load_dotenv('.ENV')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("samkazbot")
 
+class TelegramTweetLink(ndb.Model):
+    # Maps a telegram message to a tweet id, one entity will exist per published tweet. 
+    # There is a one to many mapping between telegram messages and tweets 
+    tg_msg_id = ndb.IntegerProperty()
+    tg_usr_id = ndb.IntegerProperty()
+    tg_msg = ndb.StringProperty()
+    tweet_id = ndb.IntegerProperty()
+    tweet_msg = ndb.StringProperty()
+    parent_tweet_id = ndb.IntegerProperty()
+
+# environment setup 
 PHONE_NUMBER = os.environ['PHONE_NUMBER']
 TELEGRAM_2FA_CODE = os.environ['TELEGRAM_2FA_CODE']
 TELEGRAM_API_ID = os.environ['TELEGRAM_API_ID']
 TELEGRAM_API_HASH = os.environ['TELEGRAM_API_HASH']
-PATH_TO_GSPREAD_SERVICE_ACCOUNT = os.environ['PATH_TO_GSPREAD_SERVICE_ACCOUNT']
-GSPREAD_URL = os.environ['GSPREAD_URL']
-
-# Setup connection to google sheet 
-COLS = ["telegram_msg_id", "tweet_status", "telegram_msg", "tweet_msg"]
-gc_creds_json = None 
-with Path(PATH_TO_GSPREAD_SERVICE_ACCOUNT).open('r') as f:
-    gc_creds_json = json.loads(f.read())
-gc = gspread.service_account_from_dict(gc_creds_json)
-sh = gc.open_by_url(url=GSPREAD_URL)
-print("Google spreadsheet connection established")
+GOOGLE_APPLICATION_CREDENTIALS = os.environ['GOOGLE_APPLICATION_CREDENTIALS']
+TWITTER_CLIENT_ID = os.environ['TWITTER_CLIENT_ID']
+TWITTER_CLIENT_SECRET = os.environ['TWITTER_CLIENT_SECRET']
+TWITTER_ACCESS_TOKEN = os.environ['TWITTER_ACCESS_TOKEN']
+TWITTER_ACCESS_TOKEN_SECRET = os.environ['TWITTER_ACCESS_TOKEN_SECRET']
+TWITTER_BEARER_TOKEN = os.environ['TWITTER_BEARER_TOKEN']
 
 client = TelegramClient('samkazbot', TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-graph = nx.DiGraph()
+twitter = tweepy.Client(
+    consumer_key=TWITTER_CLIENT_ID, 
+    consumer_secret=TWITTER_CLIENT_SECRET,
+    access_token=TWITTER_ACCESS_TOKEN, 
+    access_token_secret=TWITTER_ACCESS_TOKEN_SECRET, 
+    # bearer_token=TWITTER_BEARER_TOKEN, 
+)
 
-async def process_telegram_message(msg: Message, samkaz_user_id, child_node_id=None, added_msg_ids=None):
-    # Creates graph nodes for current message and all parent messages (recursively)
-    # returns the list of all message ids that were added to the graph. 
-    # This list is ordered from oldest to newest.
-    if not added_msg_ids: 
-        added_msg_ids = []
-    _id = msg.id 
-    if graph.has_node(_id):
-        logger.info(f"Message {_id} already processed") 
+db = ndb.Client()
+
+@ndb.transactional()
+def put_ttls(ttls: List[TelegramTweetLink]):
+    # All or nothing db bulk write
+    for ttl in ttls: 
+        ttl.put()
+
+def plot_digraph(graph):
+    nx.drawing.draw_networkx(graph)
+    plt.show() 
+
+async def build_tg_graph(graph: nx.DiGraph, msg: Message, tg_user_id_samk, child_node_id=None):
+    if graph.has_node(msg.id):
+        logger.info(f"Message {msg.id} already processed") 
         return 
     if type(msg.message) != str:
         raise Exception("Expected message to be string.")
     # Add current node and all parent nodes to graph 
-    # print("message", msg)
-    graph.add_node(_id, msg=msg.message, is_samkaz=msg.from_id.user_id == samkaz_user_id)
-    added_msg_ids.append(_id)
+    logger.info(f"Message {msg.id} processed!") 
+    graph.add_node(
+        msg.id, 
+        user_id=msg.from_id.user_id, 
+        msg=msg.message, 
+        is_samkaz=msg.from_id.user_id == tg_user_id_samk
+    )
     if child_node_id:
-        graph.add_edge(_id, child_node_id)
+        graph.add_edge(msg.id, child_node_id)
     msg_parent = await msg.get_reply_message()
     if msg_parent:
         # Will be defined if msg has a parent message (i.e. msg is reply to msg_parent)
         # Recursively process parent message(s)
-        await process_telegram_message(msg_parent, samkaz_user_id, child_node_id=_id, added_msg_ids=added_msg_ids)
-    # Must reverse the order before returning so that oldest messages are first. 
-    return list(reversed(added_msg_ids))
+        await build_tg_graph(graph, msg_parent, tg_user_id_samk, child_node_id=msg.id)
+
 
 def divide_string(string, n):
     return [string[i:i+n] for i in range(0, len(string), n)]
@@ -105,86 +123,139 @@ def divide_post(message: str, is_samkaz: bool, chunk_size=260):
     return [
         f"[{'samkazemian' if is_samkaz else 'anon'} {i+1} / {len(chunks)}] {chunk}" for i, chunk in enumerate(chunks)
     ]
-    
-# statuses 
-# STATUS_TWEET_PENDING: Tweet is in the process of being tweeted. 
-# STATUS_TWEETED: Tweet exists on twitter. 
-
-def is_empty_row(row): 
-    for prop in COLS:
-        if row[prop] != '':
-            return False
-    return True
-
-async def publish_tweets():
-    # Publishes tweets that have not been published yet. 
-    # Runs on a cron schedule. 
-    import datetime 
-    print("Publishing tweets...", datetime.datetime.now())
-    # Get all message ids from the graph. Note: This must be in topo-sort order 
-    all_msg_ids = list(nx.topological_sort(graph)) 
-
-    # Get the existing list of published tweets 
-    published_ids = set()
-    for row in sh.sheet1.get_all_records():
-        if is_empty_row(row):
-            continue
-        telegram_msg_id = row['telegram_msg_id']	
-        tweet_status = row['tweet_status']
-        if tweet_status == 'TWEETED': 
-            published_ids.add(telegram_msg_id)
-
-    # Clear all pending tweets from the spreadsheet
-    criteria_re = re.compile(r'^STATUS_TWEET_PENDING')
-    cell_list = sh.sheet1.findall(criteria_re)
-    print(f"Removing {len(cell_list)} pending tweets from the spreadsheet")
-    sh.sheet1.batch_clear([f"A{cell.row}:Z{cell.row}" for cell in cell_list])
-
-    # Determine which tweets are unpublished
-    unpublished_ids = set(all_msg_ids).difference(published_ids)
-
-    # All unpublished tweets should be published 
-    new_rows = []
-    for _id in all_msg_ids: 
-        if _id in unpublished_ids:
-            # Mark tweet as pending in the database 
-            telegram_msg = graph.nodes[_id]['msg']
-            is_samkaz = graph.nodes[_id]['is_samkaz']
-            tweet_msgs = divide_post(telegram_msg, is_samkaz)
-            for tweet_msg in tweet_msgs:
-                new_rows.append({
-                    "telegram_msg_id": _id, 
-                    "tweet_status": "STATUS_TWEET_PENDING", 
-                    "telegram_msg": telegram_msg, 
-                    "tweet_msg": tweet_msg
-                })
-
-    # Add the new rows to the spreadsheet to indicate the tweets are pending. 
-
-
-
-
-# Start the scheduling loop
-async def publish_tweets_loop(secs: int = 5):
-    while True: 
-        asyncio.create_task(publish_tweets())
-        await asyncio.sleep(secs)
 
 
 async def main():
+    now = datetime.now(dt.timezone.utc)
+
     # Start the telegram client
     await client.start(PHONE_NUMBER, TELEGRAM_2FA_CODE)
-    print("Client started")
+    print(f"Telegram client started at {now.isoformat()}")
     fraximalists = "https://t.me/fraxfinance"
-    frax_jesus = await client.get_entity("samkazemian")
-    samkaz_user_id = frax_jesus.id
+    tg_user_samk = await client.get_entity("samkazemian")
+    tg_user_id_samk = tg_user_samk.id
+
+    # Retrieve twitter user for bot 
+    tw_user_samkbot = twitter.get_user(username="samkazbot", user_auth=True)
+    tw_user_id_samkbot = tw_user_samkbot.data['id']
+
+    # Determine the last of sam's telegram messages that we published a tweet for
+    limit = 10
+    kwargs = {}
+    with db.context(): 
+        last_tg_msg_from_sam = (
+            TelegramTweetLink
+                .query()
+                .filter(TelegramTweetLink.tg_usr_id == tg_user_id_samk)
+                .order(-TelegramTweetLink.tg_msg_id)
+                .fetch(1)
+        )
+    if last_tg_msg_from_sam:
+        max_id_found = last_tg_msg_from_sam.pop().tg_msg_id
+        print(f"Located telegram-tweet-link in database. Max id found is: {max_id_found}")
+        # It is critical that both ids are set, so all messages in range are retrieved. see docs for get_messages for rationale. 
+        kwargs = { "min_id": max_id_found, "max_id": 2147483647 } # max possible id 
+    else: 
+        print("Application is starting for the first time")
+        kwargs = { "limit": limit }
+
+    # Start loop to retrieve telegram messages 
+    tg_msg_graph = None 
+    poll_interval = 5 
+    while True: 
+        
+        # 1. Get recent messages from samk on telegram. 
+        # case 1: If app is starting for the first time, we retrieve his last `limit` messages. 
+        # case 2: If app is restarting, we retrieve all messages after the last message we published a tweet for.
+        tg_msgs_from_sam = await client.get_messages(fraximalists, from_user=tg_user_id_samk, **kwargs)
+        print(f"Retrieved {len(tg_msgs_from_sam)} messages from samkazemian")
+        
+        # 2. Build a directed graph containing all messages from samkazemian + all ancestor messages to sam's messages. 
+        tg_msg_graph = nx.DiGraph()        
+        for new_msg in tg_msgs_from_sam:
+            await build_tg_graph(tg_msg_graph, new_msg, tg_user_id_samk)
+
+        # 3. Determine what telegram messages need to be converted to tweets 
+        print(f"There are {len(tg_msg_graph.nodes)} total messages linked to this set of messages from samkazemian")
+        min_tg_id = min(tg_msg_graph.nodes)
+        print(f"The minimum telegram msg id in this set is: {min_tg_id}")
+        with db.context(): 
+            ttls = (
+                TelegramTweetLink
+                    .query()
+                    .filter(TelegramTweetLink.tg_msg_id >= min_tg_id)
+                    .fetch()
+            )
+        
+        # Publish tweets 
+        counter = 0
+        tid_to_tweet_id = defaultdict(list)
+        for tid in nx.topological_sort(tg_msg_graph):
+            node = tg_msg_graph.nodes[tid]
+            predecessors = list(tg_msg_graph.predecessors(tid))
+            if len(predecessors) > 1: 
+                raise Exception('well this is bad lol')
+            parent = (predecessors and predecessors.pop()) or None
+            parent_tweet_id = tid_to_tweet_id[parent].pop() if parent else None
+            tweeted = any(ttl.tg_msg_id == tid for ttl in ttls)
+            if not tweeted:
+                node = tg_msg_graph.nodes[tid]
+                print(f"Creating tweet(s) for telegram message with id: {tid}")
+                msgs = divide_post(node['msg'], node['is_samkaz'])
+                for msg in msgs:
+                    print(f"- {msg}")
+                    tweet_id = counter
+                    
+                    kwargs = {}
+                    if parent_tweet_id:
+                        kwargs['in_reply_to_tweet_id'] = parent_tweet_id
+                    tweet = twitter.create_tweet(text=msg, **kwargs, user_auth=True)
+                    tweet_id = tweet.data.id 
+                    
+                    print(tweet_id)
+                    raise Exception("fuck")
+                
+                    tid_to_tweet_id[tid].append(tweet_id)
+                    # Create db artifact referencing the tweet 
+                    ttl = TelegramTweetLink(
+                        tg_msg_id = tid, 
+                        tg_usr_id = node['user_id'],
+                        tg_msg = node['msg'],
+                        tweet_id = tweet_id,
+                        tweet_msg = msg, 
+                        parent_tweet_id = parent_tweet_id, 
+                    )
+                    ttls.append(ttl)
+
+                    
+
+
+
+        # Update the database 
+        with db.context():
+            put_ttls(ttls)
+
+
+
+        await asyncio.sleep(poll_interval)
+
+
+
+
+
+
+    # print(samkazbot_id)
+    # public_tweets = twitter.get_users_tweets(samkazbot_id)
+    # print(public_tweets.data)
+    # for tweet in public_tweets.data or []:
+    #     print(type(tweet), tweet)
 
     # Each time there is a new message, we update our graph 
     # with all relevant messages that must be turned into tweets 
     # @client.on(events.NewMessage(
     #     chats=[fraximalists], 
     #     incoming=True, 
-    #     from_users=frax_jesus, 
+    #     from_users=samk, 
     # ))
     # async def handle_message_from_god(msg):
     #     # Get ids of all messages added to the graph 
@@ -193,38 +264,27 @@ async def main():
     #     print("Added messages to graph: ", added_msg_ids)
     
     # Starts the async background task that publishes tweets
-    asyncio.create_task(publish_tweets_loop())
+    # asyncio.create_task(publish_tweets_loop())
 
-    msgs = await client.get_messages(fraximalists, limit=3, from_user=frax_jesus)
-    for msg in msgs:
-        # Add relevant nodes to the graph
-        added_msg_ids = await process_telegram_message(msg, samkaz_user_id)
+    # msgs = await client.get_messages(fraximalists, limit=3, from_user=samk, )
+    # for msg in msgs:
+    #     # Add relevant nodes to the graph
+    #     added_msg_ids = await process_telegram_message(msg, samkaz_user_id)
         # For each relevant node, determine if we have tweeted yet. 
-        print(added_msg_ids)
+    #     print(added_msg_ids)
 
-    # Runs the telegram client until disconnect occurs 
-    await client.run_until_disconnected()
+    # # Runs the telegram client until disconnect occurs 
+    # await client.run_until_disconnected()
 
-
-    # import matplotlib.pyplot as plt
-    # nx.drawing.draw_networkx(graph)
-    # plt.show()
+    import matplotlib.pyplot as plt
+    nx.drawing.draw_networkx(tg_msg_graph)
+    plt.show()
 
     # await client.run_until_disconnected()
 
 if __name__ ==  '__main__':
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-
-
-
-# client2 = tweepy.Client(
-#     consumer_key=API_KEY, consumer_secret=API_KEY_SECRET,
-#     access_token=ACCESS_TOKEN, access_token_secret=ACCESS_TOKEN_SECRET
-# )
-
-
-
 
 
 # async def post_tweet(message, reply=None):

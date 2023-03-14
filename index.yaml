@@ -1,0 +1,7 @@
+indexes:
+
+- kind: TelegramTweetLink
+  properties:
+  - name: tg_usr_id
+  - name: tg_msg_id
+    direction: desc

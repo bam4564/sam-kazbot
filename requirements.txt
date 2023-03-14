@@ -1,6 +1,6 @@
 telethon 
 tweepy
-gspread
+google-cloud-ndb
 python-dotenv
 networkx
 matplotlib
